@@ -1,38 +1,23 @@
 ---
 name: Bug report
-about: Create a report to help us improve
-title: ''
-labels: ''
+about: Сообщить об ошибке в алгоритме или прошивке
+title: '[BUG] Краткое описание проблемы'
+labels: bug
 assignees: ''
 
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**Описание ошибки**
+Четкое и краткое описание того, что пошло не так.
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**Условия воспроизведения**
+* Какое жало использовалось (BC2, KU, I, C4...):
+* Какое питание подавалось (Вольт / Ватт):
+* Выставленная целевая температура ($T_{target}$):
+* Коэффициент резкости ($K_{rez}$), если менялся:
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+**Как воспроизвести**
+Шаги, которые привели к ошибке (например: "Прижал паяльник к массивному полигону, температура упала до 170 и зависла").
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
-
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
-
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
-
-**Additional context**
-Add any other context about the problem here.
+**Ожидаемое поведение**
+Как алгоритм должен был отработать по вашему мнению.
