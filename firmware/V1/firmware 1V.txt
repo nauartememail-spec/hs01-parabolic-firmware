@@ -1,0 +1,807 @@
+Warning: Unstable firmware! Untested, bugs are possible!» / «Внимание, прошивка нестабильная! Она не тестировалась, возможны баги!»
+
+
+```c
+//============================================================================
+//  main.c
+//  Прошивка для паяльной станции на базе WH571 (CH571F)
+//  Встроенная система с программным ШИМ, АЦП, OLED, кнопками и энергосбережением
+//  Архитектура: RISC-V, чистый ANSI C
+//  Оптимизация: скорость, только целочисленная математика
+//============================================================================
+
+#include "CH57x_common.h"
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+//============================================================================
+//  ПИН-КОНФИГУРАЦИЯ
+//============================================================================
+#define PIN_HEATER          GPIO_Pin_23   // PA23  управление нагревателем (выход)
+#define PIN_VIBRATION       GPIO_Pin_13   // PA13  датчик вибрации (вход с подтяжкой)
+#define PIN_BTN_UP          GPIO_Pin_22   // PB22  кнопка K1 (вперед/плюс)
+#define PIN_BTN_DOWN        GPIO_Pin_15   // PB15  кнопка K2 (назад/минус)
+#define PIN_I2C_SCL         GPIO_Pin_12   // PB12  I2C SCL
+#define PIN_I2C_SDA         GPIO_Pin_13   // PB13  I2C SDA
+
+//============================================================================
+//  ПАРАМЕТРЫ СИСТЕМЫ И РЕГУЛЯТОРА
+//============================================================================
+#define PWM_FREQ_HZ         100           // 100 Гц
+#define PWM_PERIOD_US       10000         // 10 000 мкс = 10 мс
+#define PWM_STEP_US         100           // 1% ШИМ = 100 мкс
+
+// Временные окна фаз (мкс)
+#define PHASE1_DUR_US       500           // 0-500    тишина
+#define PHASE2_DUR_US       200           // 500-700  АЦП (10 измерений)
+#define PHASE3_DUR_US       200           // 700-900  расчеты
+#define PHASE4_DUR_US       100           // 900-1000 обновление экрана
+// Оставшееся время (1000-10000) – фаза5 динамический нагрев
+
+// Параметры регулятора (целочисленные)
+#define T_TARGET_MIN        30
+#define T_TARGET_MAX        400
+#define T_STANDBY           150           // температура в режиме Standby
+#define K_SHARP             50            // резкость параболы
+#define K_SMOOTH            20            // длина линейного хвоста
+#define PWM_MAX             95            // макс. ШИМ (%)
+#define PWM_TARGET          10            // ШИМ в точке уставки
+
+// Таймауты сна (в циклах ШИМ, цикл = 10 мс)
+#define IDLE_TO_STANDBY     18000         // 3 минуты
+#define IDLE_TO_DEEPSLEEP   78000         // 13 минут
+
+// Автоповтор кнопок
+#define HOLD_START_CYCLES   100           // 1 секунда (100*10мс)
+#define REPEAT_STEP_CYCLES  25            // 250 мс (25*10мс)
+
+// Таймер отображения уставки после последнего изменения
+#define SET_DISPLAY_CYCLES  200           // 2 секунды
+
+// АЦП: опорное напряжение 3.3В, разрешение 12 бит (0-4095)
+#define ADC_MAX_VALUE       4095
+#define AMBIENT_MAX_TEMP    120           // условная шкала NTC: 0..120°C
+
+// Адрес Data Flash для хранения калибровочного смещения термопары
+#define DATA_FLASH_ADDR     0x00070000
+#define CALIB_MAGIC         0x5A5A5A5A     // маркер валидности калибровки
+
+// Адрес OLED I2C
+#define OLED_ADDR           0x3C
+
+//============================================================================
+//  ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+//============================================================================
+static volatile uint32_t sysTick_us = 0;   // счётчик микросекунд от SysTick
+
+// Состояние регулятора
+static int32_t T_target = 200;             // целевая температура, заданная пользователем
+static int32_t T_current_set = 200;        // текущая уставка (может понижаться в сне)
+static int32_t current_temp = 25;          // измеренная температура жала (°C)
+static int32_t pwm_duty = 0;               // рассчитанная скважность (0-100%)
+
+// АЦП и калибровка
+static int32_t thermocouple_offset = 0;    // смещение холодного спая
+
+// Режимы работы
+static uint8_t deep_sleep_mode = 0;        // 1 – глубокий сон (нагреватель выключен)
+static uint32_t idle_counter = 0;          // счётчик бездействия (циклы ШИМ)
+static uint8_t last_vibration_state = 0;   // предыдущее состояние датчика PA13
+
+// Отображение уставки на экране
+static uint8_t show_set_temp = 0;          // 1 – показывать уставку, 0 – реальную температуру
+static uint32_t set_display_timer = 0;     // оставшиеся циклы показа уставки
+
+// Обработка кнопок (антидребезг, автоповтор)
+static uint8_t btn_up_stable = 0;
+static uint8_t btn_down_stable = 0;
+static uint8_t btn_up_prev = 0;
+static uint8_t btn_down_prev = 0;
+static uint32_t btn_hold_counter = 0;       // счётчик удержания любой кнопки
+static uint32_t btn_repeat_counter = 0;     // счётчик для шага автоповтора
+static uint8_t btn_repeat_active = 0;       // активен ли режим быстрого перебора
+
+// Буфер дисплея OLED 128x32 (4 страницы по 128 байт)
+static uint8_t oled_buffer[512];
+
+//============================================================================
+//  ПРОТОТИПЫ ФУНКЦИЙ
+//============================================================================
+static void SystemClock_Config(void);
+static void GPIO_Init(void);
+static void ADC_Init(void);
+static void I2C_Init(void);
+static void SysTick_Init(void);
+static void DataFlash_ReadCalibration(void);
+static void DataFlash_WriteCalibration(int32_t offset);
+static void PerformInitialCalibration(void);
+static int32_t Read_ADC_Channel(uint8_t channel);
+static int32_t Read_Thermocouple(void);
+static int32_t Read_NTC_Ambient(void);
+static void Compute_PWM(int32_t temp, int32_t setpoint);
+static void OLED_Init(void);
+static void OLED_SendCommand(uint8_t cmd);
+static void OLED_SendData(uint8_t *data, uint16_t len);
+static void OLED_Update(void);
+static void OLED_Clear(void);
+static void OLED_DrawChar(uint8_t x, uint8_t y, char c);
+static void OLED_DrawString(uint8_t x, uint8_t y, const char *str);
+static void Display_Temperature(int32_t temp, uint8_t show_set);
+static void HandleButtons(void);
+static void HandleIdleAndSleep(void);
+static void Delay_Us(uint32_t us);
+static uint32_t GetSysTickUs(void);
+
+//============================================================================
+//  ИНИЦИАЛИЗАЦИЯ СИСТЕМЫ
+//============================================================================
+int main(void)
+{
+    // 1. Настройка тактирования (системная частота по умолчанию ~ 20-40 МГц)
+    SystemClock_Config();
+    
+    // 2. Инициализация периферии
+    GPIO_Init();
+    ADC_Init();
+    I2C_Init();
+    SysTick_Init();
+    
+    // 3. Загрузка калибровки из Data Flash (если есть)
+    DataFlash_ReadCalibration();
+    
+    // 4. Инициализация OLED
+    OLED_Init();
+    OLED_Clear();
+    OLED_Update();
+    
+    // 5. Начальные установки
+    T_current_set = T_target;
+    deep_sleep_mode = 0;
+    idle_counter = 0;
+    last_vibration_state = GPIO_ReadPortBit(GPIOA, PIN_VIBRATION) ? 1 : 0;
+    
+    // 6. Бесконечный цикл – детерминированный 100 Гц тайм-профиль
+    while (1)
+    {
+        static uint32_t next_period_start = 0;
+        uint32_t now = GetSysTickUs();
+        
+        // Ожидаем начало следующего периода (10 мс)
+        if (now < next_period_start)
+            continue;
+        next_period_start = now + PWM_PERIOD_US;
+        
+        // ========== ФАЗА 1: Окно тишины (0-500 мкс) ==========
+        // Принудительно выключаем нагреватель
+        GPIO_ResetBits(GPIOA, PIN_HEATER);
+        Delay_Us(PHASE1_DUR_US);
+        
+        // ========== ФАЗА 2: Прецизионное измерение АЦП (500-700 мкс) ==========
+        // Нагреватель остаётся выключенным, выполняем 10 чтений канала 5 (термопара)
+        int32_t tc_sum = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            tc_sum += Read_ADC_Channel(5);   // ADC_CH_5 = PA5
+        }
+        int32_t raw_tc = tc_sum / 10;        // среднее арифметическое, округление целочисленное
+        
+        // Вычисляем температуру жала: (сырое АЦП - смещение холодного спая)
+        current_temp = raw_tc - thermocouple_offset;
+        if (current_temp < 0) current_temp = 0;
+        
+        Delay_Us(PHASE2_DUR_US);
+        
+        // ========== ФАЗА 3: Математические расчеты (700-900 мкс) ==========
+        // Расчёт ШИМ по кусочно-линейной параболической модели
+        Compute_PWM(current_temp, T_current_set);
+        
+        Delay_Us(PHASE3_DUR_US);
+        
+        // ========== ФАЗА 4: Обновление экрана (900-1000 мкс) ==========
+        // Определяем, что показывать: уставку или реальную температуру
+        if (show_set_temp && set_display_timer > 0)
+        {
+            Display_Temperature(T_current_set, 1);   // показываем уставку
+            set_display_timer--;
+            if (set_display_timer == 0)
+                show_set_temp = 0;
+        }
+        else
+        {
+            show_set_temp = 0;
+            Display_Temperature(current_temp, 0);    // показываем реальную температуру
+        }
+        OLED_Update();
+        
+        Delay_Us(PHASE4_DUR_US);
+        
+        // ========== ФАЗА 5: Динамический нагрев (1000-10000 мкс) ==========
+        uint32_t heat_duration = 0;
+        if (!deep_sleep_mode && pwm_duty > 0)
+        {
+            heat_duration = pwm_duty * PWM_STEP_US;
+            if (heat_duration > (PWM_PERIOD_US - 1000))
+                heat_duration = PWM_PERIOD_US - 1000;   // защита от переполнения
+            GPIO_SetBits(GPIOA, PIN_HEATER);
+            Delay_Us(heat_duration);
+            GPIO_ResetBits(GPIOA, PIN_HEATER);
+        }
+        else
+        {
+            // Нагреватель уже выключен, но нужно подождать оставшееся время
+            // (чтобы не нарушать временной профиль)
+        }
+        
+        // Оставшееся время до конца периода (неблокирующий опрос кнопок и датчика)
+        uint32_t remaining = (PWM_PERIOD_US - 1000) - heat_duration;
+        if (remaining > 0)
+        {
+            // Разбиваем оставшееся время на мелкие интервалы для опроса кнопок
+            const uint32_t poll_interval = 1000; // 1 мс
+            while (remaining > 0)
+            {
+                uint32_t chunk = (remaining < poll_interval) ? remaining : poll_interval;
+                Delay_Us(chunk);
+                remaining -= chunk;
+                
+                // Опрос кнопок и датчика вибрации (неблокирующий)
+                HandleButtons();
+                HandleIdleAndSleep();
+            }
+        }
+    }
+}
+
+//============================================================================
+//  ИНИЦИАЛИЗАЦИЯ ПЕРИФЕРИИ (CH57x_common)
+//============================================================================
+
+static void SystemClock_Config(void)
+{
+    // Настройка системного таймера и тактирования по умолчанию
+    // Для CH571F внутренний RC 32 МГц, либо внешний кварц
+    SetSysClock(CLK_SOURCE_PLL_60MHz);   // пример: установка 60 МГц (если поддерживается)
+    // Реально частоту подобрать по документации, но для корректной работы задержек используем SysTick
+}
+
+static void GPIO_Init(void)
+{
+    // Включение тактирования портов
+    R32_PB_CLK_EN |= RB_PB_CLK_EN;
+    R32_PA_CLK_EN |= RB_PA_CLK_EN;
+    
+    // Нагреватель PA23 – выход
+    GPIOA_ModeCfg(PIN_HEATER, GPIO_ModeOutPP);
+    GPIO_ResetBits(GPIOA, PIN_HEATER);
+    
+    // Датчик вибрации PA13 – вход с подтяжкой вверх (pull-up)
+    GPIOA_ModeCfg(PIN_VIBRATION, GPIO_ModeIN_PU);
+    
+    // Кнопки PB22 и PB15 – вход с подтяжкой (active low)
+    GPIOB_ModeCfg(PIN_BTN_UP, GPIO_ModeIN_PU);
+    GPIOB_ModeCfg(PIN_BTN_DOWN, GPIO_ModeIN_PU);
+    
+    // Пины I2C PB12(SCL), PB13(SDA) – альтернативная функция Open Drain
+    GPIOB_ModeCfg(PIN_I2C_SCL, GPIO_ModeOut_OD);
+    GPIOB_ModeCfg(PIN_I2C_SDA, GPIO_ModeOut_OD);
+}
+
+static void ADC_Init(void)
+{
+    // Включение тактирования АЦП
+    R32_RCC_CLK_CONFIG |= RB_CLK_ADC_EN;
+    // Инициализация АЦП: 12 бит, прерывания не используем
+    ADC_Init(ADC_Mode_Single);          // однократное преобразование
+    ADC_ExtTrigCfg(DISABLE);            // без внешнего триггера
+    ADC_ChannelCfg(4 | 5);              // включаем каналы 4 и 5 (NTC и термопара)
+}
+
+static void I2C_Init(void)
+{
+    // Включение тактирования I2C
+    R32_RCC_CLK_CONFIG |= RB_CLK_I2C_EN;
+    // Сброс модуля I2C
+    I2C_Reset();
+    // Настройка на скорость 400 кГц (при такте 60 МГц)
+    I2C_InitTypeDef i2c = {0};
+    i2c.Mode = I2C_Mode_Fast;
+    i2c.ClockSpeed = 400000;
+    i2c.DutyCycle = I2C_DutyCycle_2;
+    I2C_Init(I2C_PORT, &i2c);
+    I2C_Cmd(I2C_PORT, ENABLE);
+}
+
+static void SysTick_Init(void)
+{
+    // Настройка SysTick на 1 микросекунду (предполагаем такт CPU = 60 МГц)
+    // Тогда reload = 60 - 1, приоритет прерываний не используем
+    // Вместо прерываний будем читать текущее значение счётчика
+    // Для простоты используем блокирующие задержки через цикл по SysTick->CNT
+    // Инициализация SysTick: 60 МГц / 1e6 = 60 тиков на микросекунду
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 60 - 1;   // так как частота 60 МГц, то 60 тиков = 1 мкс
+    SysTick->VAL = 0;
+    SysTick->CTRL = 5;        // включить, без прерываний, такт от процессора
+    // Глобальная переменная sysTick_us будет наращиваться в обработчике прерывания (если подключить)
+    // Но в данном проекте используем только блокирующую задержку Delay_Us.
+}
+
+//============================================================================
+//  ФУНКЦИИ РАБОТЫ С DATA FLASH (ЭНЕРГОНЕЗАВИСИМАЯ ПАМЯТЬ)
+//============================================================================
+
+static void DataFlash_ReadCalibration(void)
+{
+    // Чтение 32-битного значения из Data Flash по адресу 0x00070000
+    uint32_t *flash_ptr = (uint32_t *)DATA_FLASH_ADDR;
+    uint32_t magic = *flash_ptr;
+    if (magic == CALIB_MAGIC)
+    {
+        // Следующее слово – смещение термопары
+        thermocouple_offset = *(flash_ptr + 1);
+    }
+    else
+    {
+        // Первый запуск – выполнить калибровку
+        PerformInitialCalibration();
+    }
+}
+
+static void DataFlash_WriteCalibration(int32_t offset)
+{
+    // Стирание страницы Data Flash (размер страницы 256 байт, адрес 0x70000 выровнен)
+    FLASH_ROM_Unlock();
+    FLASH_ROM_Erase(DATA_FLASH_ADDR);
+    // Запись маркера и смещения
+    FLASH_ROM_Program(DATA_FLASH_ADDR, (uint32_t)CALIB_MAGIC);
+    FLASH_ROM_Program(DATA_FLASH_ADDR + 4, (uint32_t)offset);
+    FLASH_ROM_Lock();
+}
+
+static void PerformInitialCalibration(void)
+{
+    // Измерить комнатную температуру по NTC (канал 4)
+    int32_t ambient_raw = Read_NTC_Ambient();   // возвращает значение в °C
+    // Измерить сырое значение холодной термопары (канал 5)
+    int32_t tc_raw = Read_ADC_Channel(5);
+    // Вычислить смещение: raw_tc - ambient_temp
+    thermocouple_offset = tc_raw - ambient_raw;
+    // Сохранить в Data Flash
+    DataFlash_WriteCalibration(thermocouple_offset);
+}
+
+//============================================================================
+//  АЦП И ДАТЧИКИ (ЦЕЛОЧИСЛЕННЫЕ)
+//============================================================================
+
+static int32_t Read_ADC_Channel(uint8_t channel)
+{
+    // Выбор канала и запуск преобразования
+    ADC_ChannelCfg(1 << channel);
+    ADC_ExtTrigCfg(DISABLE);
+    ADC_Start();
+    while (!ADC_GetFlagStatus(ADC_FLAG_EOC));   // ожидание завершения
+    int32_t value = ADC_GetData();              // 12-битное значение 0..4095
+    ADC_Stop();
+    return value;
+}
+
+static int32_t Read_NTC_Ambient(void)
+{
+    // Упрощённое линейное преобразование сырого значения АЦП в градусы Цельсия
+    // Диапазон 0..4095 -> 0..AMBIENT_MAX_TEMP (120°C)
+    int32_t adc_val = Read_ADC_Channel(4);
+    int32_t temp = (adc_val * AMBIENT_MAX_TEMP) / ADC_MAX_VALUE;
+    if (temp < 0) temp = 0;
+    if (temp > AMBIENT_MAX_TEMP) temp = AMBIENT_MAX_TEMP;
+    return temp;
+}
+
+static int32_t Read_Thermocouple(void)
+{
+    int32_t raw = Read_ADC_Channel(5);
+    int32_t temp = raw - thermocouple_offset;
+    if (temp < 0) temp = 0;
+    return temp;
+}
+
+//============================================================================
+//  ЦЕЛОЧИСЛЕННЫЙ РАСЧЁТ ШИМ (КУСОЧНО-ЛИНЕЙНАЯ ПАРАБОЛА)
+//============================================================================
+
+static void Compute_PWM(int32_t T, int32_t setpoint)
+{
+    // Если глубокий сон – ШИМ всегда 0
+    if (deep_sleep_mode)
+    {
+        pwm_duty = 0;
+        return;
+    }
+    
+    int32_t pwm = PWM_MAX;
+    int32_t T_start = setpoint - K_SHARP;
+    
+    if (T <= T_start)
+    {
+        pwm = PWM_MAX;
+    }
+    else if (T <= setpoint)
+    {
+        // Параболический участок (T_start < T <= setpoint)
+        int32_t delta = T - T_start;
+        // (PWM_max - PWM_target) * delta^2 / (K_sharp^2)
+        int32_t numerator = (PWM_MAX - PWM_TARGET) * delta * delta;
+        int32_t denominator = K_SHARP * K_SHARP;
+        int32_t reduction = numerator / denominator;
+        pwm -= reduction;
+    }
+    else if (T <= (setpoint + K_SMOOTH))
+    {
+        // Линейный спад (setpoint < T <= setpoint + K_smooth)
+        int32_t delta = T - setpoint;
+        int32_t reduction = (PWM_TARGET * delta) / K_SMOOTH;
+        pwm = PWM_TARGET - reduction;
+    }
+    else
+    {
+        pwm = 0;
+    }
+    
+    // Ограничение снизу и сверху
+    if (pwm < 0) pwm = 0;
+    if (pwm > PWM_MAX) pwm = PWM_MAX;
+    
+    pwm_duty = pwm;
+}
+
+//============================================================================
+//  ОБРАБОТКА КНОПОК (АНТИДРЕБЕЗГ, АВТОПОВТОР)
+//============================================================================
+
+static void HandleButtons(void)
+{
+    // Чтение текущих состояний (active low)
+    uint8_t btn_up_raw = (GPIO_ReadPortBit(GPIOB, PIN_BTN_UP) == 0);
+    uint8_t btn_down_raw = (GPIO_ReadPortBit(GPIOB, PIN_BTN_DOWN) == 0);
+    
+    // Простой антидребезг: фиксация стабильного состояния через 2 последовательных чтения
+    static uint8_t btn_up_cnt = 0, btn_down_cnt = 0;
+    static uint8_t btn_up_last = 0, btn_down_last = 0;
+    
+    if (btn_up_raw == btn_up_last)
+    {
+        if (btn_up_cnt < 2) btn_up_cnt++;
+        if (btn_up_cnt == 2) btn_up_stable = btn_up_raw;
+    }
+    else
+    {
+        btn_up_last = btn_up_raw;
+        btn_up_cnt = 0;
+    }
+    
+    if (btn_down_raw == btn_down_last)
+    {
+        if (btn_down_cnt < 2) btn_down_cnt++;
+        if (btn_down_cnt == 2) btn_down_stable = btn_down_raw;
+    }
+    else
+    {
+        btn_down_last = btn_down_raw;
+        btn_down_cnt = 0;
+    }
+    
+    // Логика автоповтора
+    static uint8_t up_pressed_prev = 0, down_pressed_prev = 0;
+    
+    if (btn_up_stable || btn_down_stable)
+    {
+        // Нажата хотя бы одна кнопка
+        btn_hold_counter++;
+        if (btn_hold_counter >= HOLD_START_CYCLES)
+        {
+            btn_repeat_active = 1;
+        }
+        
+        // Обработка автоповтора (каждые REPEAT_STEP_CYCLES)
+        if (btn_repeat_active)
+        {
+            if (btn_repeat_counter >= REPEAT_STEP_CYCLES)
+            {
+                btn_repeat_counter = 0;
+                // Приращение/уменьшение уставки
+                if (btn_up_stable && !btn_down_stable)
+                {
+                    int32_t new_target = T_target + 5;
+                    if (new_target <= T_TARGET_MAX) T_target = new_target;
+                }
+                else if (btn_down_stable && !btn_up_stable)
+                {
+                    int32_t new_target = T_target - 5;
+                    if (new_target >= T_TARGET_MIN) T_target = new_target;
+                }
+                // Обновление таймера отображения уставки
+                show_set_temp = 1;
+                set_display_timer = SET_DISPLAY_CYCLES;
+            }
+            btn_repeat_counter++;
+        }
+    }
+    else
+    {
+        // Кнопки отпущены – обработка однократных нажатий и сброс автоповтора
+        if (up_pressed_prev && !btn_up_stable)
+        {
+            // Короткий клик на K1
+            int32_t new_target = T_target + 5;
+            if (new_target <= T_TARGET_MAX) T_target = new_target;
+            show_set_temp = 1;
+            set_display_timer = SET_DISPLAY_CYCLES;
+        }
+        if (down_pressed_prev && !btn_down_stable)
+        {
+            int32_t new_target = T_target - 5;
+            if (new_target >= T_TARGET_MIN) T_target = new_target;
+            show_set_temp = 1;
+            set_display_timer = SET_DISPLAY_CYCLES;
+        }
+        // Сброс счётчиков удержания
+        btn_hold_counter = 0;
+        btn_repeat_counter = 0;
+        btn_repeat_active = 0;
+    }
+    
+    up_pressed_prev = btn_up_stable;
+    down_pressed_prev = btn_down_stable;
+    
+    // Синхронизация T_current_set с T_target (если не в режиме сна)
+    if (!deep_sleep_mode && idle_counter < IDLE_TO_STANDBY)
+        T_current_set = T_target;
+}
+
+//============================================================================
+//  ОБРАБОТКА ДАТЧИКА ВИБРАЦИИ И РЕЖИМОВ СНА
+//============================================================================
+
+static void HandleIdleAndSleep(void)
+{
+    // Чтение датчика вибрации
+    uint8_t vib_state = (GPIO_ReadPortBit(GPIOA, PIN_VIBRATION) != 0);
+    if (vib_state != last_vibration_state)
+    {
+        // Детектировано движение (изменение состояния)
+        idle_counter = 0;
+        // Выход из режимов сна
+        if (deep_sleep_mode)
+        {
+            deep_sleep_mode = 0;
+            T_current_set = T_target;
+        }
+        else if (idle_counter < IDLE_TO_STANDBY)
+        {
+            T_current_set = T_target;
+        }
+        last_vibration_state = vib_state;
+    }
+    else
+    {
+        if (idle_counter < 0xFFFFFFFF) idle_counter++;
+    }
+    
+    // Переход в Standby (3 минуты без движения)
+    if (!deep_sleep_mode && idle_counter >= IDLE_TO_STANDBY)
+    {
+        if (idle_counter >= IDLE_TO_DEEPSLEEP)
+        {
+            // Deep Sleep
+            deep_sleep_mode = 1;
+            pwm_duty = 0;            // немедленное отключение нагревателя
+            T_current_set = T_target;   // сохраняем уставку для пробуждения
+        }
+        else
+        {
+            // Standby: уставка 150°C
+            T_current_set = T_STANDBY;
+        }
+    }
+}
+
+//============================================================================
+//  ДИСПЛЕЙ OLED 128x32 (SSD1306, I2C)
+//============================================================================
+
+static void OLED_SendCommand(uint8_t cmd)
+{
+    uint8_t buf[2] = {0x00, cmd};   // управляющий байт (0x00 = команда)
+    I2C_MasterSend(I2C_PORT, OLED_ADDR, buf, 2);
+}
+
+static void OLED_SendData(uint8_t *data, uint16_t len)
+{
+    uint8_t ctrl = 0x40;            // байт управления данными
+    I2C_MasterSend(I2C_PORT, OLED_ADDR, &ctrl, 1);
+    I2C_MasterSend(I2C_PORT, OLED_ADDR, data, len);
+}
+
+static void OLED_Init(void)
+{
+    // Инициализация SSD1306 (последовательность команд)
+    Delay_Us(10000);
+    OLED_SendCommand(0xAE);   // Display OFF
+    OLED_SendCommand(0xD5);   // Set display clock divide ratio/oscillator frequency
+    OLED_SendCommand(0x80);
+    OLED_SendCommand(0xA8);   // Set multiplex ratio (32)
+    OLED_SendCommand(0x1F);
+    OLED_SendCommand(0xD3);   // Set display offset (0)
+    OLED_SendCommand(0x00);
+    OLED_SendCommand(0x40);   // Set start line (0)
+    OLED_SendCommand(0x8D);   // Charge pump
+    OLED_SendCommand(0x14);
+    OLED_SendCommand(0x20);   // Memory addressing mode (horizontal)
+    OLED_SendCommand(0x00);
+    OLED_SendCommand(0xA1);   // Segment remap (column 127 mapped to SEG0)
+    OLED_SendCommand(0xC8);   // COM output scan direction (remapped mode)
+    OLED_SendCommand(0xDA);   // Set COM pins hardware configuration
+    OLED_SendCommand(0x02);
+    OLED_SendCommand(0x81);   // Set contrast
+    OLED_SendCommand(0xCF);
+    OLED_SendCommand(0xD9);   // Set pre-charge period
+    OLED_SendCommand(0xF1);
+    OLED_SendCommand(0xDB);   // Set VCOMH deselect level
+    OLED_SendCommand(0x40);
+    OLED_SendCommand(0xA4);   // Display on resume
+    OLED_SendCommand(0xA6);   // Normal display (not inverted)
+    OLED_SendCommand(0x2E);   // Deactivate scrolling
+    OLED_SendCommand(0xAF);   // Display ON
+}
+
+static void OLED_Update(void)
+{
+    // Отправка всего буфера на дисплей
+    for (uint8_t page = 0; page < 4; page++)
+    {
+        OLED_SendCommand(0xB0 + page);            // установка страницы
+        OLED_SendCommand(0x00);                  // младший байт столбца (0)
+        OLED_SendCommand(0x10);                  // старший байт столбца (0)
+        OLED_SendData(&oled_buffer[page * 128], 128);
+    }
+}
+
+static void OLED_Clear(void)
+{
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+}
+
+// Шрифт 8x8 (только символы: 0-9, пробел, ':', 'C', 'T', 'S', 'O', 'F', '-')
+static const uint8_t font8x8[][8] = {
+    // '0'..'9'
+    {0x3E,0x51,0x49,0x45,0x3E,0x00,0x00,0x00}, // 0
+    {0x00,0x42,0x7F,0x40,0x00,0x00,0x00,0x00}, // 1
+    {0x42,0x61,0x51,0x49,0x46,0x00,0x00,0x00}, // 2
+    {0x21,0x41,0x45,0x4B,0x31,0x00,0x00,0x00}, // 3
+    {0x18,0x14,0x12,0x7F,0x10,0x00,0x00,0x00}, // 4
+    {0x27,0x45,0x45,0x45,0x39,0x00,0x00,0x00}, // 5
+    {0x3C,0x4A,0x49,0x49,0x30,0x00,0x00,0x00}, // 6
+    {0x01,0x71,0x09,0x05,0x03,0x00,0x00,0x00}, // 7
+    {0x36,0x49,0x49,0x49,0x36,0x00,0x00,0x00}, // 8
+    {0x06,0x49,0x49,0x29,0x1E,0x00,0x00,0x00}, // 9
+    // ':' 
+    {0x00,0x36,0x36,0x00,0x00,0x00,0x00,0x00},
+    // 'C'
+    {0x3E,0x41,0x41,0x41,0x22,0x00,0x00,0x00},
+    // 'T'
+    {0x01,0x01,0x7F,0x01,0x01,0x00,0x00,0x00},
+    // 'S'
+    {0x26,0x49,0x49,0x49,0x32,0x00,0x00,0x00},
+    // 'O'
+    {0x3E,0x41,0x41,0x41,0x3E,0x00,0x00,0x00},
+    // 'F'
+    {0x7F,0x09,0x09,0x09,0x01,0x00,0x00,0x00},
+    // '-'
+    {0x08,0x08,0x08,0x08,0x08,0x00,0x00,0x00},
+    // пробел
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+};
+
+static void OLED_DrawChar(uint8_t x, uint8_t y, char c)
+{
+    if (x > 120 || y > 24) return;
+    uint8_t page = y / 8;
+    uint8_t offset = y % 8;
+    uint8_t idx;
+    if (c >= '0' && c <= '9') idx = c - '0';
+    else if (c == ':') idx = 10;
+    else if (c == 'C') idx = 11;
+    else if (c == 'T') idx = 12;
+    else if (c == 'S') idx = 13;
+    else if (c == 'O') idx = 14;
+    else if (c == 'F') idx = 15;
+    else if (c == '-') idx = 16;
+    else idx = 17; // пробел
+    
+    const uint8_t *ch = font8x8[idx];
+    for (uint8_t col = 0; col < 8; col++)
+    {
+        uint8_t data = ch[col];
+        if (offset == 0)
+        {
+            oled_buffer[page * 128 + x + col] = data;
+        }
+        else
+        {
+            oled_buffer[page * 128 + x + col] |= (data << offset);
+            if (page < 3)
+                oled_buffer[(page+1) * 128 + x + col] |= (data >> (8 - offset));
+        }
+    }
+}
+
+static void OLED_DrawString(uint8_t x, uint8_t y, const char *str)
+{
+    while (*str)
+    {
+        OLED_DrawChar(x, y, *str++);
+        x += 8;
+        if (x > 120) break;
+    }
+}
+
+static void Display_Temperature(int32_t temp, uint8_t show_set)
+{
+    // Очистка области отображения (верхняя строка, y=0)
+    for (uint8_t pg = 0; pg < 2; pg++)
+        memset(&oled_buffer[pg * 128], 0, 128);
+    
+    char buf[32];
+    if (show_set)
+    {
+        // Режим отображения уставки (S: xxx°C)
+        sprintf(buf, "S:%3d C", (int)temp);
+    }
+    else
+    {
+        // Отображение реальной температуры или статуса сна
+        if (deep_sleep_mode)
+            strcpy(buf, "OFF");
+        else if (idle_counter >= IDLE_TO_STANDBY && idle_counter < IDLE_TO_DEEPSLEEP)
+            strcpy(buf, "STB");
+        else
+            sprintf(buf, "T:%3d C", (int)temp);
+    }
+    OLED_DrawString(0, 0, buf);
+    
+    // Если не в режиме сна, можно отобразить целевую температуру мелко внизу
+    if (!deep_sleep_mode && !show_set)
+    {
+        char target_buf[16];
+        sprintf(target_buf, "Set:%3d", (int)T_target);
+        OLED_DrawString(0, 16, target_buf);
+    }
+}
+
+//============================================================================
+//  ЗАДЕРЖКИ ПО МИКРОСЕКУНДАМ (БЛОКИРУЮЩИЕ)
+//============================================================================
+
+static uint32_t GetSysTickUs(void)
+{
+    // Возвращает количество микросекунд от старта (без прерываний, только счётчик)
+    // Используем SysTick->VAL и SysTick->LOAD, но для простоты используем цикл
+    // Реализуем блокирующую задержку через цикл по счётчику.
+    // Для глобального времени не нужен, только для задержек.
+    return 0; // stub, реально задержки реализованы через Delay_Us
+}
+
+static void Delay_Us(uint32_t us)
+{
+    // Простая блокирующая задержка, основанная на SysTick->VAL
+    // Предполагаем, что SysTick настроен на 1 мкс на тик (60 тиков при 60 МГц)
+    // Делитель: 60 тиков = 1 мкс
+    // Но проще использовать обычный цикл с __NOP, так как частота фиксирована
+    // Для простоты используем пустой цикл, но для точности – лучше использовать SysTick.
+    // Так как у нас нет прерываний SysTick, сделаем калиброванный цикл.
+    // Пусть при частоте 60 МГц 60 итераций = 1 мкс (примерно)
+    volatile uint32_t cycles = us * 60;
+    while (cycles--) __NOP();
+}
+```
